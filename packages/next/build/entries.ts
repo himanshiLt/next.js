@@ -10,17 +10,27 @@ import fs from 'fs'
 import chalk from 'next/dist/compiled/chalk'
 import { posix, join } from 'path'
 import { stringify } from 'querystring'
-import { API_ROUTE, DOT_NEXT_ALIAS, PAGES_DIR_ALIAS } from '../lib/constants'
-import { EDGE_RUNTIME_WEBPACK } from '../shared/lib/constants'
+import {
+  API_ROUTE,
+  DOT_NEXT_ALIAS,
+  PAGES_DIR_ALIAS,
+  VIEWS_DIR_ALIAS,
+} from '../lib/constants'
+import {
+  CLIENT_STATIC_FILES_RUNTIME_AMP,
+  CLIENT_STATIC_FILES_RUNTIME_MAIN,
+  CLIENT_STATIC_FILES_RUNTIME_MAIN_ROOT,
+  CLIENT_STATIC_FILES_RUNTIME_REACT_REFRESH,
+  EDGE_RUNTIME_WEBPACK,
+} from '../shared/lib/constants'
 import { MIDDLEWARE_ROUTE } from '../lib/constants'
 import { __ApiPreviewProps } from '../server/api-utils'
 import { isTargetLikeServerless } from '../server/utils'
-import { normalizePagePath } from '../server/normalize-page-path'
-import { normalizePathSep } from '../server/denormalize-page-path'
-import { ssrEntries } from './webpack/plugins/middleware-plugin'
 import { warn } from './output/log'
 import { parse } from '../build/swc'
-import { isFlightPage, withoutRSCExtensions } from './utils'
+import { isServerComponentPage, withoutRSCExtensions } from './utils'
+import { normalizePathSep } from '../shared/lib/page-path/normalize-path-sep'
+import { normalizePagePath } from '../shared/lib/page-path/normalize-page-path'
 
 type ObjectValue<T> = T extends { [key: string]: infer V } ? V : never
 
@@ -34,9 +44,11 @@ export function getPageFromPath(pagePath: string, pageExtensions: string[]) {
     ? withoutRSCExtensions(pageExtensions)
     : pageExtensions
 
-  const page = normalizePathSep(
+  let page = normalizePathSep(
     pagePath.replace(new RegExp(`\\.+(${extensions.join('|')})$`), '')
-  ).replace(/\/index$/, '')
+  )
+
+  page = page.replace(/\/index$/, '')
 
   return page === '' ? '/' : page
 }
@@ -44,15 +56,18 @@ export function getPageFromPath(pagePath: string, pageExtensions: string[]) {
 export function createPagesMapping({
   hasServerComponents,
   isDev,
+  isViews,
   pageExtensions,
   pagePaths,
 }: {
   hasServerComponents: boolean
   isDev: boolean
+  isViews?: boolean
   pageExtensions: string[]
   pagePaths: string[]
 }): { [page: string]: string } {
   const previousPages: { [key: string]: string } = {}
+  const pathAlias = isViews ? VIEWS_DIR_ALIAS : PAGES_DIR_ALIAS
   const pages = pagePaths.reduce<{ [key: string]: string }>(
     (result, pagePath) => {
       // Do not process .d.ts files inside the `pages` folder
@@ -81,7 +96,7 @@ export function createPagesMapping({
         previousPages[pageKey] = pagePath
       }
 
-      result[pageKey] = normalizePathSep(join(PAGES_DIR_ALIAS, pagePath))
+      result[pageKey] = normalizePathSep(join(pathAlias, pagePath))
       return result
     },
     {}
@@ -90,6 +105,11 @@ export function createPagesMapping({
   // In development we always alias these to allow Webpack to fallback to
   // the correct source file so that HMR can work properly when a file is
   // added or removed.
+
+  if (isViews) {
+    return pages
+  }
+
   if (isDev) {
     delete pages['/_app']
     delete pages['/_app.server']
@@ -223,6 +243,9 @@ interface CreateEntrypointsParams {
   pagesDir: string
   previewMode: __ApiPreviewProps
   target: 'server' | 'serverless' | 'experimental-serverless-trace'
+  viewsDir?: string
+  viewPaths?: Record<string, string>
+  pageExtensions: string[]
 }
 
 export function getEdgeServerEntry(opts: {
@@ -233,7 +256,6 @@ export function getEdgeServerEntry(opts: {
   isDev: boolean
   page: string
   pages: { [page: string]: string }
-  ssrEntries: Map<string, { requireFlightManifest: boolean }>
 }): ObjectValue<webpack5.EntryObject> {
   if (opts.page.match(MIDDLEWARE_ROUTE)) {
     const loaderParams: MiddlewareLoaderOptions = {
@@ -253,16 +275,23 @@ export function getEdgeServerEntry(opts: {
     absolutePagePath: opts.absolutePagePath,
     buildId: opts.buildId,
     dev: opts.isDev,
-    isServerComponent: isFlightPage(opts.config, opts.absolutePagePath),
+    isServerComponent: isServerComponentPage(
+      opts.config,
+      opts.absolutePagePath
+    ),
     page: opts.page,
     stringifiedConfig: JSON.stringify(opts.config),
   }
 
-  ssrEntries.set(opts.bundlePath, {
-    requireFlightManifest: isFlightPage(opts.config, opts.absolutePagePath),
-  })
-
   return `next-middleware-ssr-loader?${stringify(loaderParams)}!`
+}
+
+export function getViewsEntry(opts: {
+  pagePath: string
+  viewsDir: string
+  pageExtensions: string[]
+}) {
+  return `next-view-loader?${stringify(opts)}!`
 }
 
 export function getServerlessEntry(opts: {
@@ -329,58 +358,89 @@ export function getClientEntry(opts: {
 }
 
 export async function createEntrypoints(params: CreateEntrypointsParams) {
-  const { config, pages, pagesDir, isDev, target } = params
+  const {
+    config,
+    pages,
+    pagesDir,
+    isDev,
+    target,
+    viewsDir,
+    viewPaths,
+    pageExtensions,
+  } = params
   const edgeServer: webpack5.EntryObject = {}
   const server: webpack5.EntryObject = {}
   const client: webpack5.EntryObject = {}
 
-  await Promise.all(
-    Object.keys(pages).map(async (page) => {
+  const getEntryHandler =
+    (mappings: Record<string, string>, isViews: boolean) =>
+    async (page: string) => {
       const bundleFile = normalizePagePath(page)
       const clientBundlePath = posix.join('pages', bundleFile)
-      const serverBundlePath = posix.join('pages', bundleFile)
+      const serverBundlePath = posix.join(
+        isViews ? 'views' : 'pages',
+        bundleFile
+      )
+
+      // Handle paths that have aliases
+      const pageFilePath = (() => {
+        const absolutePagePath = mappings[page]
+        if (absolutePagePath.startsWith(PAGES_DIR_ALIAS)) {
+          return absolutePagePath.replace(PAGES_DIR_ALIAS, pagesDir)
+        }
+
+        if (absolutePagePath.startsWith(VIEWS_DIR_ALIAS) && viewsDir) {
+          return absolutePagePath.replace(VIEWS_DIR_ALIAS, viewsDir)
+        }
+
+        return require.resolve(absolutePagePath)
+      })()
 
       runDependingOnPageType({
         page,
-        pageRuntime: await getPageRuntime(
-          !pages[page].startsWith(PAGES_DIR_ALIAS)
-            ? require.resolve(pages[page])
-            : join(pagesDir, pages[page].replace(PAGES_DIR_ALIAS, '')),
-          config,
-          isDev
-        ),
+        pageRuntime: await getPageRuntime(pageFilePath, config, isDev),
         onClient: () => {
           client[clientBundlePath] = getClientEntry({
-            absolutePagePath: pages[page],
+            absolutePagePath: mappings[page],
             page,
           })
         },
         onServer: () => {
-          if (isTargetLikeServerless(target)) {
+          if (isViews && viewsDir) {
+            server[serverBundlePath] = getViewsEntry({
+              pagePath: mappings[page],
+              viewsDir,
+              pageExtensions,
+            })
+          } else if (isTargetLikeServerless(target)) {
             if (page !== '/_app' && page !== '/_document') {
               server[serverBundlePath] = getServerlessEntry({
                 ...params,
-                absolutePagePath: pages[page],
+                absolutePagePath: mappings[page],
                 page,
               })
             }
           } else {
-            server[serverBundlePath] = [pages[page]]
+            server[serverBundlePath] = [mappings[page]]
           }
         },
         onEdgeServer: () => {
           edgeServer[serverBundlePath] = getEdgeServerEntry({
             ...params,
-            absolutePagePath: pages[page],
+            absolutePagePath: mappings[page],
             bundlePath: clientBundlePath,
             isDev: false,
             page,
-            ssrEntries,
           })
         },
       })
-    })
-  )
+    }
+
+  if (viewsDir && viewPaths) {
+    const entryHandler = getEntryHandler(viewPaths, true)
+    await Promise.all(Object.keys(viewPaths).map(entryHandler))
+  }
+  await Promise.all(Object.keys(pages).map(getEntryHandler(pages, false)))
 
   return {
     client,
@@ -454,9 +514,10 @@ export function finalizeEntrypoint({
   if (
     // Client special cases
     name !== 'polyfills' &&
-    name !== 'main' &&
-    name !== 'amp' &&
-    name !== 'react-refresh'
+    name !== CLIENT_STATIC_FILES_RUNTIME_MAIN &&
+    name !== CLIENT_STATIC_FILES_RUNTIME_MAIN_ROOT &&
+    name !== CLIENT_STATIC_FILES_RUNTIME_AMP &&
+    name !== CLIENT_STATIC_FILES_RUNTIME_REACT_REFRESH
   ) {
     return {
       dependOn:
