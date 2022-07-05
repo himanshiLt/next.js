@@ -2,7 +2,7 @@
 framework: jest
 preRun:
   command:
-    - yarn
+    - pnpm install
 preMerge:
   env:
     TRACE_PLAYWRIGHT: true
