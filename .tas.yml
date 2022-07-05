@@ -3,7 +3,6 @@ framework: jest
 preRun:
   command:
     - npm i -g pnpm@$7.2.1
-    - pnpm install
     - npm run build
 preMerge:
   env:
