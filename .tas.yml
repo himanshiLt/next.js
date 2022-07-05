@@ -2,6 +2,7 @@
 framework: jest
 preRun:
   command:
+    - npm i turbo-cli 
     - pnpm run build
 preMerge:
   env:
