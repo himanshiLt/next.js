@@ -2,9 +2,7 @@
 framework: jest
 preRun:
   command:
-    - npm i -g pnpm@$7.2.1
-    - npm i turbo-cli
-    - npm run build
+    - pnpm run build
 preMerge:
   env:
     TRACE_PLAYWRIGHT: true
