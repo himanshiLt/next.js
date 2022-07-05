@@ -2,7 +2,7 @@
 framework: jest
 preRun:
   command:
-    - npm i turbo-cli 
+    - pnpm install --shamefully-hoist
     - pnpm run build
 preMerge:
   env:
